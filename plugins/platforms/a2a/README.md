@@ -40,6 +40,35 @@ The agent gets five tools:
 - `a2a_orchestrate(capability, message, mode?)` — fan-out a task to every
   peer advertising a capability (`all` / `first` / `best`).
 
+## ERC-8004 — find peers on-chain, choose them by reputation
+
+With an `erc8004` section in `config.yaml`, peers also come from the
+[ERC-8004](https://eips.ethereum.org/EIPS/eip-8004) Identity Registry: every
+registered agent points to a registration file, which points to its Agent
+Card, and the card's skills become the peer's capabilities. The file must name
+the same agent id, so an agent cannot borrow another agent's file. Two more
+tools appear:
+
+- `a2a_delegate(capability, message)` — send the task to the one peer with the
+  best average rating for that capability in the Reputation Registry. Peers
+  that nobody has rated yet go first; ties are broken at random.
+- `a2a_feedback(agent, value, capability)` — write a rating from 0 to 100
+  on-chain, signed with this agent's wallet, after checking the answer.
+
+```yaml
+erc8004:
+  rpc_url: "https://base-sepolia-rpc.publicnode.com"
+  identity_registry: "0x8004A818BFB912233c491871b3d84c89A494BD9e"
+  reputation_registry: "0x8004B663056A597Dffe9eCcC1965A193B7388713"
+  start_block: 54282581          # agents registered before this block are ignored
+  owners: []                     # optional: only agents registered by these addresses
+  reviewers: []                  # whose ratings count; empty: only this agent's own
+  key_env: "ERC8004_PRIVATE_KEY" # env var with the private key of a TEST wallet
+```
+
+It needs `web3` in Hermes's environment. Ratings use `tag1 = "task"` and
+`tag2 = <capability>`.
+
 ## Inbound — be callable
 
 When the `a2a` platform is enabled, Hermes serves a v1.0 Agent Card at

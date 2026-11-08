@@ -1,6 +1,8 @@
 """A2A client tools (``a2a`` toolset): a2a_discover/call/list/history/orchestrate talk to *other*
 agents. Peers come from config.yaml ``a2a_agents: {name: {url, auth: {type: bearer, token}, timeout,
-capabilities}}``. Stdlib urllib; wire format is A2A v1.0 ``SendMessage`` (v0.3 replies still parse)."""
+capabilities}}``. Stdlib urllib; wire format is A2A v1.0 ``SendMessage`` (v0.3 replies still parse).
+With an ``erc8004`` section, peers also come from the ERC-8004 Identity Registry, a2a_delegate picks
+one by its on-chain reputation, and a2a_feedback rates it on-chain (see erc8004.py)."""
 
 from __future__ import annotations
 
@@ -14,7 +16,7 @@ from typing import Any, Optional
 
 from gateway.platforms._shared import coerce_port as _coerce_int, get_scoped_secret as _get_scoped_secret
 
-from . import protocol, security
+from . import erc8004, protocol, security
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +31,15 @@ def _load_config() -> dict:
 
 
 def _configured_peers() -> dict:
-    return _load_config().get("a2a_agents") or {}
+    """Hand-written peers (``a2a_agents``), plus the agents found on-chain when ``erc8004`` is set."""
+    cfg = _load_config()
+    peers = dict(cfg.get("a2a_agents") or {})
+    if chain := cfg.get("erc8004"):
+        try:
+            peers.update(erc8004.discover_peers(chain))
+        except Exception as e:  # chain unreachable or web3 missing: keep the hand-written peers
+            logger.warning("ERC-8004 discovery failed: %s", e)
+    return peers
 
 
 def _peer_from_entry(entry: dict, **extra: Any) -> dict:
@@ -289,6 +299,60 @@ def a2a_orchestrate(args: dict, **_: Any) -> str:
                      + [line for name, reply in results for line in (f"\n--- {name} ---", reply)])
 
 
+def a2a_delegate(args: dict, **_: Any) -> str:
+    """Send a task to ONE on-chain peer with the capability: the one with the best ERC-8004 rating."""
+    capability = str(args.get("capability") or "").strip()
+    message = str(args.get("message") or args.get("task") or "").strip()
+    context_id = str(args.get("context_id") or args.get("contextId") or "").strip()
+    if not capability or not message:
+        return "Error: both 'capability' and 'message' are required."
+    if not (chain := _load_config().get("erc8004")):
+        return "Error: a2a_delegate needs an 'erc8004' section in config.yaml (see the A2A plugin README)."
+    try:
+        peers = {name: peer for name, peer in erc8004.discover_peers(chain).items()
+                 if capability in peer["capabilities"]}
+        if not peers:
+            return f"Error: no agent in the ERC-8004 Identity Registry declares the capability '{capability}'."
+        by_id = erc8004.ratings(chain, [peer["agent_id"] for peer in peers.values()], capability)
+        rated = {name: by_id[peer["agent_id"]] for name, peer in peers.items()}
+        name = erc8004.choose(rated, erc8004.random_source(chain))
+    except Exception as e:
+        return f"Error: the ERC-8004 lookup failed — {e}."
+    rate_hint = f"a2a_feedback(agent='{name}', value=0-100, capability='{capability}')"
+    try:
+        reply, reply_ctx, state = _send_task(name, _peer_from_entry(peers[name]), message, context_id)
+    except Exception as e:
+        return f"Error: call to '{name}' failed — {e}. Rate the failure with {rate_hint.replace('0-100', '0')}."
+    count, average = rated[name]
+    rating = f"rated {average:g}/100 by {count} rating(s)" if count else "not rated yet"
+    short_state = state.replace("TASK_STATE_", "").replace("_", "-").lower()
+    header = f"[delegate: {name} · {rating} · context {reply_ctx}" + (f" · {short_state}" if state else "") + "]"
+    return f"{header}\n{reply or '(no text reply)'}\n\n(Check this answer, then rate the peer: {rate_hint}.)"
+
+
+def a2a_feedback(args: dict, **_: Any) -> str:
+    """Write an ERC-8004 rating (0-100) on-chain for a peer, normally one that a2a_delegate chose."""
+    agent = str(args.get("agent") or args.get("agent_name") or "").strip()
+    capability = str(args.get("capability") or "").strip()
+    if not agent or not capability:
+        return "Error: 'agent', 'value' and 'capability' are required."
+    if not (chain := _load_config().get("erc8004")):
+        return "Error: a2a_feedback needs an 'erc8004' section in config.yaml (see the A2A plugin README)."
+    try:
+        value = int(args.get("value"))
+    except (TypeError, ValueError):
+        return "Error: 'value' must be a whole number from 0 to 100."
+    if not 0 <= value <= 100:
+        return "Error: 'value' must be a whole number from 0 to 100."
+    if (agent_id := erc8004.agent_id_from_name(agent)) is None:
+        return "Error: 'agent' must be a name returned by a2a_delegate (name#agentId) or an agentId."
+    try:
+        tx_hash = erc8004.give_feedback(chain, agent_id, value, capability)
+    except Exception as e:
+        return f"Error: the rating was not recorded — {e}."
+    return f"Rated agent {agent_id} {value}/100 for '{capability}' on-chain (transaction {tx_hash})."
+
+
 def _str(description: str) -> dict:
     return {"type": "string", "description": description}
 
@@ -323,6 +387,22 @@ _TOOLS: dict[str, tuple[Any, str, dict, list[str]]] = {
                          "mode": {"type": "string", "enum": ["all", "first", "best"], "description": "How to aggregate results. Default: 'all'."},
                          "context_id": _str("Optional: shared context id for all peers.")},
                         ["capability", "message"]),
+    "a2a_delegate": (a2a_delegate,
+                     "Send a task to the single best peer for a capability, chosen by its ERC-8004 on-chain "
+                     "reputation. Peers come from the ERC-8004 Identity Registry, and their capabilities from "
+                     "their own Agent Cards. After checking the reply, rate the peer with a2a_feedback.",
+                     {"capability": _str("Capability (skill id) the task needs, e.g. 'flight-search'."),
+                      "message": _str("The task to send to the chosen peer."),
+                      "context_id": _str("Optional: context id from a prior reply, to continue the conversation.")},
+                     ["capability", "message"]),
+    "a2a_feedback": (a2a_feedback,
+                     "Record an ERC-8004 rating on-chain for a peer that a2a_delegate chose, after you have "
+                     "checked its answer: 100 for a fully correct answer, 0 for a wrong answer or a failure.",
+                     {"agent": _str("The peer's name as a2a_delegate returned it (name#agentId)."),
+                      "value": {"type": "integer", "minimum": 0, "maximum": 100,
+                                "description": "Rating from 0 (wrong or failed) to 100 (fully correct)."},
+                      "capability": _str("The capability the task used, as passed to a2a_delegate.")},
+                     ["agent", "value", "capability"]),
 }
 
 
@@ -338,7 +418,7 @@ def _a2a_tools_available() -> bool:
     cfg = {}
     with contextlib.suppress(Exception):
         cfg = _load_config()
-        if cfg.get("a2a_agents"):
+        if cfg.get("a2a_agents") or cfg.get("erc8004"):
             return True
     try:
         # Scoped like the platform gate: os.environ is the launch profile's under multiplexing (#122126).
