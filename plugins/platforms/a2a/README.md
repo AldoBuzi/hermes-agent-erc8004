@@ -69,6 +69,50 @@ erc8004:
 It needs `web3` in Hermes's environment. Ratings use `tag1 = "task"` and
 `tag2 = <capability>`.
 
+### Try it
+
+Status: the ERC-8004 tools pass their tests and work when they are called directly, but no
+session driven by an LLM has used them yet.
+
+Hermes's lock file covers only Python 3.14. A plain `pip install -e .` stops on a Pillow
+version conflict that only the lock file settles, so install from the lock with
+[uv](https://docs.astral.sh/uv/), and then add `web3`. Any Python 3.14 environment works;
+with conda:
+
+```bash
+conda create -n hermes -c conda-forge python=3.14
+conda activate hermes
+git clone --depth 1 --branch erc8004 https://github.com/AldoBuzi/hermes-agent-erc8004.git
+cd hermes-agent-erc8004
+uv export --frozen --no-dev --no-hashes --no-emit-project -o /tmp/hermes-requirements.txt
+uv pip install --python "$(which python)" --no-deps -r /tmp/hermes-requirements.txt
+uv pip install --python "$(which python)" --no-deps -e .
+uv pip install --python "$(which python)" -c /tmp/hermes-requirements.txt web3==8.0.0
+```
+
+Give this setup its own home folder, so that it does not touch `~/.hermes`, and choose a
+model there. `hermes model` also asks for the provider's API key.
+
+```bash
+export HERMES_HOME=~/hermes-erc8004-home
+hermes model
+```
+
+Then add the `erc8004` section above to `$HERMES_HOME/config.yaml` (create the file if it does
+not exist), and put the private key of a test wallet in the environment. `read -s` keeps the
+key off the screen and out of the shell history.
+
+```bash
+read -s ERC8004_PRIVATE_KEY && export ERC8004_PRIVATE_KEY
+```
+
+The `a2a` toolset is off by default, so turn it on for the session with `-t a2a`. The model
+is then offered only the A2A tools.
+
+```bash
+hermes chat -t a2a --oneshot -q 'Use a2a_delegate to send this task to an agent with the capability flight-search: ... Check the answer, then rate the agent with a2a_feedback.'
+```
+
 ## Inbound — be callable
 
 When the `a2a` platform is enabled, Hermes serves a v1.0 Agent Card at
