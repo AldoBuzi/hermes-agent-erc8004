@@ -302,7 +302,9 @@ def a2a_orchestrate(args: dict, **_: Any) -> str:
 def a2a_delegate(args: dict, **_: Any) -> str:
     """Send a task to ONE on-chain peer with the capability: the one with the best ERC-8004 rating."""
     capability = str(args.get("capability") or "").strip()
-    message = str(args.get("message") or args.get("task") or "").strip()
+    raw = args.get("message") or args.get("task") or ""
+    # Models often pass the message as an object: send it as JSON, which agents can read, not as Python text.
+    message = (json.dumps(raw) if isinstance(raw, (dict, list)) else str(raw)).strip()
     context_id = str(args.get("context_id") or args.get("contextId") or "").strip()
     if not capability or not message:
         return "Error: both 'capability' and 'message' are required."

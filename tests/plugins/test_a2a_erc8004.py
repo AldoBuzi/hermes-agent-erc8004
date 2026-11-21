@@ -98,6 +98,14 @@ class TestToolsWithErc8004(unittest.TestCase):
         with self._config({}):
             self.assertIn("erc8004", a2at.a2a_delegate({"capability": "c", "message": "m"}))
 
+    def test_delegate_sends_an_object_as_json(self):
+        found = {"flights#3": {"url": "http://y.invalid", "capabilities": ["flight-search"], "agent_id": 3}}
+        with self._config({"erc8004": CHAIN}), patch.object(erc, "discover_peers", return_value=found), \
+                patch.object(erc, "ratings", return_value={3: (0, 0.0)}), \
+                patch.object(a2at, "_send_task", return_value=("ok", "ctx-1", "")) as send:
+            a2at.a2a_delegate({"capability": "flight-search", "message": {"from": "Pisa", "to": "Rome"}})
+        self.assertEqual(send.call_args.args[2], '{"from": "Pisa", "to": "Rome"}')
+
     def test_feedback_checks_its_inputs(self):
         with self._config({"erc8004": CHAIN}):
             self.assertIn("0 to 100", a2at.a2a_feedback({"agent": "a#1", "value": 150, "capability": "c"}))
