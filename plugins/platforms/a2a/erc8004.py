@@ -7,7 +7,8 @@ after a task. With an ``erc8004`` section in config.yaml:
 
 - the client tools find peers in the Identity Registry, with the skills that each peer's own
   Agent Card declares, in addition to the hand-written ``a2a_agents`` list;
-- ``a2a_delegate`` sends a task to the one peer with the best rating for that skill;
+- ``a2a_delegate`` sends a task to the one peer that the selection strategy trusts most for
+  that skill;
 - ``a2a_feedback`` writes a rating on-chain, signed with this agent's own wallet.
 
     erc8004:
@@ -18,7 +19,24 @@ after a task. With an ``erc8004`` section in config.yaml:
       owners: []                      # optional: only agents registered by these addresses
       reviewers: []                   # whose ratings count; empty means only this agent's own
       key_env: "ERC8004_PRIVATE_KEY"  # environment variable with the wallet's private key
-      seed: 42                        # optional: repeatable choice among equally rated peers
+      seed: 42                        # optional: repeatable random choices
+      strategy: S2                    # S2 (the default) or S3, see below
+      trust:                          # optional, S3 only: each key overrides one default
+        other_weight: 0.1             # the weight of a rating from a reviewer not in reviewers
+        half_life: 5                  # after this many newer ratings, a rating counts half; null: off
+        owner_weight: 0.5             # how much of its owner's record a new agent inherits; 0: off
+        choice: sample                # sample (Thompson sampling) or mean (no exploration)
+
+The two strategies:
+
+- S2, plain reputation: the best average of the reviewers' ratings (getSummary). Peers that
+  nobody has rated yet go first.
+- S3, trust-aware: every rating, read from the NewFeedback events, adds to a Beta
+  distribution of the peer's chance to answer correctly. Ratings from the reviewers count
+  fully and the others only a little (against fake reviewers); newer ratings count more
+  (against an agent that turns bad); and a new agent starts from the record of its owner's
+  other agents (against clone farms). The peer with the highest sample wins, so peers with few
+  ratings are still tried now and then.
 
 web3 is imported only when the section is used, so installs without it are unaffected.
 """
@@ -29,7 +47,9 @@ import json
 import logging
 import random
 import urllib.request
-from typing import Any, Optional
+from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Any, NamedTuple, Optional
 
 from gateway.platforms._shared import get_scoped_secret as _get_scoped_secret
 
@@ -50,6 +70,12 @@ def _function(name: str, inputs: list[tuple[str, str]], outputs: list[tuple[str,
             "outputs": [{"name": n, "type": t} for n, t in outputs]}
 
 
+def _event(name: str, inputs: list[tuple[str, str, bool]]) -> dict:
+    """One ABI event, from (name, type, indexed) for each of its inputs."""
+    return {"type": "event", "name": name, "anonymous": False,
+            "inputs": [{"name": n, "type": t, "indexed": i} for n, t, i in inputs]}
+
+
 # Only the parts of the two registries that the tools use.
 _IDENTITY_ABI = [
     {"type": "event", "name": "Registered", "anonymous": False, "inputs": [
@@ -67,6 +93,14 @@ _REPUTATION_ABI = [
               [("agentId", "uint256"), ("value", "int128"), ("valueDecimals", "uint8"), ("tag1", "string"),
                ("tag2", "string"), ("endpoint", "string"), ("feedbackURI", "string"), ("feedbackHash", "bytes32")],
               [], "nonpayable"),
+    # The events give each rating with its reviewer and its block, which S3 needs.
+    _event("NewFeedback",
+           [("agentId", "uint256", True), ("clientAddress", "address", True), ("feedbackIndex", "uint64", False),
+            ("value", "int128", False), ("valueDecimals", "uint8", False), ("indexedTag1", "string", True),
+            ("tag1", "string", False), ("tag2", "string", False), ("endpoint", "string", False),
+            ("feedbackURI", "string", False), ("feedbackHash", "bytes32", False)]),
+    _event("FeedbackRevoked",
+           [("agentId", "uint256", True), ("clientAddress", "address", True), ("feedbackIndex", "uint64", True)]),
 ]
 
 _rng: Optional[random.Random] = None
@@ -191,6 +225,161 @@ def choose(rated: dict[str, tuple[int, float]], rng: random.Random) -> str:
         return rng.choice(unrated)
     best = max(average for _, average in rated.values())
     return rng.choice(sorted(name for name, (_, average) in rated.items() if average == best))
+
+
+class Rating(NamedTuple):
+    """One rating that S3 uses: one NewFeedback event that was not revoked."""
+
+    agent_id: int
+    reviewer: str
+    value: float  # from 0 (wrong or failed) to 100 (correct)
+    block: int    # the block where it was stored, which says how old it is
+
+
+@dataclass
+class TrustSettings:
+    """The settings of S3. Each signal can be switched off, to measure what it is worth."""
+
+    trusted: set[str] = field(default_factory=set)  # lower-case addresses whose ratings count fully
+    other_weight: float = 0.1        # the weight of a rating from any other reviewer; 1: off
+    half_life: Optional[float] = 5   # after this many newer ratings of the agent, a rating counts half; None: off
+    owner_weight: float = 0.5        # how much of the owner's other agents' record a new agent inherits; 0: off
+    choice: str = "sample"           # "sample": Thompson sampling; "mean": the highest mean, no exploration
+    prior: tuple[float, float] = (1.0, 1.0)  # the Beta prior (successes, failures) of an agent with no ratings
+
+
+def trust_settings(cfg: dict) -> TrustSettings:
+    """S3's settings: the reviewers are the trusted ones, and the ``trust`` part overrides the defaults."""
+    values = dict(cfg.get("trust") or {})
+    if "prior" in values:
+        values["prior"] = tuple(values["prior"])
+    return TrustSettings(trusted={address.lower() for address in reviewers(cfg)}, **values)
+
+
+def ratings_from_logs(new_logs: list, revoked_logs: list, capability: str) -> list[Rating]:
+    """The ratings for this capability in NewFeedback events, without those that FeedbackRevoked events cancel."""
+    revoked = {(e["args"]["agentId"], e["args"]["clientAddress"], e["args"]["feedbackIndex"]) for e in revoked_logs}
+    found = []
+    for event in new_logs:
+        args = event["args"]
+        if (args["tag1"], args["tag2"]) != (FEEDBACK_TAG, capability):
+            continue
+        if (args["agentId"], args["clientAddress"], args["feedbackIndex"]) in revoked:
+            continue
+        found.append(Rating(args["agentId"], args["clientAddress"], args["value"] / 10 ** args["valueDecimals"],
+                            event["blockNumber"]))
+    return found
+
+
+def all_ratings(cfg: dict, agent_ids: list[int], capability: str) -> list[Rating]:
+    """Every rating of these agents for this capability since start_block, from any reviewer.
+
+    Unlike getSummary, the events give each rating with its reviewer and its block. They are read
+    in chunks, because public RPC servers refuse log queries over too many blocks.
+    """
+    w3 = _web3(cfg)
+    reputation = _contract(w3, cfg["reputation_registry"], _REPUTATION_ABI)
+    filters = {"agentId": list(agent_ids)}
+    latest = w3.eth.block_number
+    new_logs: list = []
+    revoked_logs: list = []
+    for first in range(int(cfg.get("start_block") or 0), latest + 1, LOG_CHUNK_BLOCKS):
+        last = min(first + LOG_CHUNK_BLOCKS - 1, latest)
+        for logs, event in ((new_logs, reputation.events.NewFeedback), (revoked_logs, reputation.events.FeedbackRevoked)):
+            logs += event().get_logs(argument_filters=filters, from_block=first, to_block=last)
+    return ratings_from_logs(new_logs, revoked_logs, capability)
+
+
+def _evidence(found: list[Rating], settings: TrustSettings) -> dict[int, tuple[float, float]]:
+    """For each rated agent: its weighted successes and failures, after the reviewer and recency weights."""
+    by_agent: dict[int, list[Rating]] = defaultdict(list)
+    for rating in found:
+        by_agent[rating.agent_id].append(rating)
+    evidence = {}
+    for agent_id, agent_ratings in by_agent.items():
+        successes = failures = 0.0
+        newest_first = sorted(agent_ratings, key=lambda rating: rating.block, reverse=True)
+        for newer, rating in enumerate(newest_first):  # newer: how many of its ratings are more recent
+            weight = 1.0 if rating.reviewer.lower() in settings.trusted else settings.other_weight
+            if settings.half_life:
+                weight *= 0.5 ** (newer / settings.half_life)
+            successes += weight * rating.value / 100
+            failures += weight * (1 - rating.value / 100)
+        evidence[agent_id] = (successes, failures)
+    return evidence
+
+
+def beliefs(peers: dict[str, dict], found: list[Rating], settings: TrustSettings) -> dict[str, tuple[float, float]]:
+    """For each peer: the Beta distribution (alpha, beta) of its chance to answer correctly.
+
+    It is the prior, plus the record of the owner's other peers (weighted by owner_weight), plus
+    the peer's own evidence.
+    """
+    evidence = _evidence(found, settings)
+    by_owner: dict[str, list[int]] = defaultdict(list)
+    for peer in peers.values():
+        by_owner[str(peer.get("owner") or "").lower()].append(peer["agent_id"])
+    result = {}
+    for name, peer in peers.items():
+        alpha, beta = settings.prior
+        owner = str(peer.get("owner") or "").lower()
+        if settings.owner_weight and owner:
+            for sibling in by_owner[owner]:
+                if sibling != peer["agent_id"]:
+                    sibling_successes, sibling_failures = evidence.get(sibling, (0.0, 0.0))
+                    alpha += settings.owner_weight * sibling_successes
+                    beta += settings.owner_weight * sibling_failures
+        successes, failures = evidence.get(peer["agent_id"], (0.0, 0.0))
+        result[name] = (alpha + successes, beta + failures)
+    return result
+
+
+def choose_trust_aware(belief: dict[str, tuple[float, float]], rng: random.Random, choice: str = "sample") -> str:
+    """S3: the peer with the highest sample of its Beta distribution, or with choice="mean" the highest mean."""
+    names = sorted(belief)
+    if choice == "mean":
+        mean = {name: alpha / (alpha + beta) for name, (alpha, beta) in belief.items()}
+        best = max(mean.values())
+        return rng.choice([name for name in names if mean[name] == best])
+    samples = {name: rng.betavariate(*belief[name]) for name in names}
+    return max(names, key=samples.__getitem__)
+
+
+def _draws(cfg: dict, capability: str, found: list[Rating]) -> random.Random:
+    """The random generator for one S3 choice.
+
+    Every Hermes session is a new process, so a generator seeded once per process would repeat
+    the same numbers in every session, and a peer whose first sample was low would never be
+    tried. With a seed, the numbers therefore depend on the seed, the capability and the number
+    of ratings: they change from one choice to the next, and a rerun on the same chain repeats them.
+    """
+    if cfg.get("seed") is None:
+        return random_source(cfg)
+    return random.Random(f"{cfg['seed']}:{capability}:{len(found)}")
+
+
+STRATEGIES = ("S2", "S3")
+
+
+def pick(cfg: dict, peers: dict[str, dict], capability: str) -> tuple[str, str]:
+    """The peer to delegate to, by the strategy of the config (S2 by default), and a short note on its rating."""
+    strategy = str(cfg.get("strategy") or "S2").upper()
+    agent_ids = [peer["agent_id"] for peer in peers.values()]
+    if strategy == "S2":
+        by_id = ratings(cfg, agent_ids, capability)
+        rated = {name: by_id[peer["agent_id"]] for name, peer in peers.items()}
+        name = choose(rated, random_source(cfg))
+        count, average = rated[name]
+        return name, (f"rated {average:g}/100 by {count} rating(s)" if count else "not rated yet")
+    if strategy == "S3":
+        settings = trust_settings(cfg)
+        found = all_ratings(cfg, agent_ids, capability)
+        belief = beliefs(peers, found, settings)
+        name = choose_trust_aware(belief, _draws(cfg, capability, found), settings.choice)
+        alpha, beta = belief[name]
+        count = sum(rating.agent_id == peers[name]["agent_id"] for rating in found)
+        return name, f"trust {alpha / (alpha + beta):.2f} from {count} rating(s)"
+    raise ValueError(f"unknown strategy {strategy!r}; known: {', '.join(STRATEGIES)}")
 
 
 def give_feedback(cfg: dict, agent_id: int, value: int, capability: str) -> str:

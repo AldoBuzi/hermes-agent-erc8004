@@ -49,9 +49,15 @@ Card, and the card's skills become the peer's capabilities. The file must name
 the same agent id, so an agent cannot borrow another agent's file. Two more
 tools appear:
 
-- `a2a_delegate(capability, message)` — send the task to the one peer with the
-  best average rating for that capability in the Reputation Registry. Peers
-  that nobody has rated yet go first; ties are broken at random.
+- `a2a_delegate(capability, message)` — send the task to the one peer that the
+  selection strategy trusts most for that capability. With `strategy: S2` (the
+  default), that is the best average rating in the Reputation Registry; peers
+  that nobody has rated yet go first, and ties are broken at random. With
+  `strategy: S3` (trust-aware), every rating adds to a Beta distribution of the
+  peer's chance to answer correctly: ratings from `reviewers` count fully and
+  the others only a little, newer ratings count more, and a new agent starts
+  from its owner's record. The peer with the highest sample wins, so peers with
+  few ratings are still tried now and then.
 - `a2a_feedback(agent, value, capability)` — write a rating from 0 to 100
   on-chain, signed with this agent's wallet, after checking the answer.
 
@@ -64,6 +70,13 @@ erc8004:
   owners: []                     # optional: only agents registered by these addresses
   reviewers: []                  # whose ratings count; empty: only this agent's own
   key_env: "ERC8004_PRIVATE_KEY" # env var with the private key of a TEST wallet
+  seed: 42                       # optional: repeatable random choices
+  strategy: S2                   # S2 (plain average) or S3 (trust-aware)
+  trust:                         # optional, S3 only: each key overrides one default
+    other_weight: 0.1            # weight of a rating from a reviewer not in reviewers
+    half_life: 5                 # after this many newer ratings, a rating counts half
+    owner_weight: 0.5            # how much of its owner's record a new agent inherits
+    choice: sample               # sample (Thompson sampling) or mean (no exploration)
 ```
 
 It needs `web3` in Hermes's environment. Ratings use `tag1 = "task"` and

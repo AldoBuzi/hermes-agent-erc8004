@@ -1,12 +1,14 @@
 """ERC-8004 additions to the a2a client tools. These tests need no blockchain.
 
-They cover the choice of a peer by rating, the check that a registration file points back
-to its agent, how on-chain peers join the hand-written ones, and the tools' input checks.
+They cover the choice of a peer by rating (S2 and S3), the check that a registration file
+points back to its agent, how on-chain peers join the hand-written ones, and the tools' input
+checks.
 """
 import os
 import random
 import sys
 import unittest
+from collections import Counter
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -28,6 +30,83 @@ class TestChoose(unittest.TestCase):
     def test_ties_are_not_broken_by_name(self):
         rated = {"a#1": (2, 100.0), "z#2": (5, 100.0)}
         self.assertEqual({erc.choose(rated, random.Random(seed)) for seed in range(20)}, {"a#1", "z#2"})
+
+
+US = "0xUs"  # the trusted reviewer
+
+
+def _history(agent_id, values, reviewer=US, first_block=1):
+    """Ratings of one agent in this order, one per block, starting at first_block."""
+    return [erc.Rating(agent_id, reviewer, value, first_block + step) for step, value in enumerate(values)]
+
+
+def _peers(*entries):
+    """Peers from (name, agent_id, owner)."""
+    return {name: {"agent_id": agent_id, "owner": owner} for name, agent_id, owner in entries}
+
+
+def _best(peers, found, seed=0, **trust):
+    """S3's choice with the highest mean. The other signals are off unless a test switches one on."""
+    settings = erc.TrustSettings(**{"trusted": {US.lower()}, "half_life": None, "owner_weight": 0,
+                                    "choice": "mean", **trust})
+    return erc.choose_trust_aware(erc.beliefs(peers, found, settings), random.Random(seed), settings.choice)
+
+
+class TestTrustAware(unittest.TestCase):
+    """S3. Each test shows what one signal adds."""
+
+    def test_events_keep_this_capability_and_drop_revoked_ratings(self):
+        def event(agent_id, index, value, tag2="flight-search"):
+            return {"args": {"agentId": agent_id, "clientAddress": US, "feedbackIndex": index, "value": value,
+                             "valueDecimals": 0, "tag1": "task", "tag2": tag2}, "blockNumber": 7}
+        revoked = [{"args": {"agentId": 1, "clientAddress": US, "feedbackIndex": 2}}]
+        new = [event(1, 1, 100), event(1, 2, 0), event(2, 1, 100, tag2="hotel-search")]
+        self.assertEqual(erc.ratings_from_logs(new, revoked, "flight-search"), [erc.Rating(1, US, 100, 7)])
+
+    def test_fake_reviewers_barely_count(self):
+        peers = _peers(("honest#1", 1, "0xA"), ("liar#2", 2, "0xB"))
+        found = _history(1, [100, 100, 0]) + _history(2, [0])
+        found += _history(2, [100] * 10, reviewer="0xSybil", first_block=10)
+        self.assertEqual(_best(peers, found), "honest#1")
+        self.assertEqual(_best(peers, found, other_weight=1), "liar#2")  # every reviewer counts, as in S2
+
+    def test_newer_ratings_drop_an_agent_that_turned_bad(self):
+        peers = _peers(("turned#1", 1, "0xA"), ("steady#2", 2, "0xB"))
+        found = _history(1, [100] * 20 + [0] * 4) + _history(2, [100, 100, 100, 0])
+        self.assertEqual(_best(peers, found), "turned#1")  # without recency, 20 old ratings still win
+        self.assertEqual(_best(peers, found, half_life=2), "steady#2")
+
+    def test_a_clone_inherits_its_owners_record(self):
+        peers = _peers(("bad#1", 1, "0xBad"), ("clone#2", 2, "0xBad"), ("new#3", 3, "0xGood"))
+        found = _history(1, [0] * 5)
+        chosen = {owner_weight: {_best(peers, found, seed, owner_weight=owner_weight) for seed in range(20)}
+                  for owner_weight in (0, 0.5)}
+        self.assertEqual(chosen[0], {"clone#2", "new#3"})  # the clone looks as fresh as a newcomer
+        self.assertEqual(chosen[0.5], {"new#3"})
+
+    def test_sampling_mostly_exploits_but_still_tries_a_newcomer(self):
+        peers = _peers(("good#1", 1, "0xA"), ("new#2", 2, "0xB"), ("bad#3", 3, "0xC"))
+        found = _history(1, [100] * 10) + _history(3, [0])
+        belief = erc.beliefs(peers, found, erc.TrustSettings(trusted={US.lower()}))
+        rng = random.Random(42)
+        chosen = Counter(erc.choose_trust_aware(belief, rng) for _ in range(200))
+        self.assertEqual(chosen.most_common(1)[0][0], "good#1")
+        self.assertGreater(chosen["new#2"], 0)
+
+    def test_each_choice_draws_new_numbers_but_a_rerun_repeats_them(self):
+        first = erc._draws({"seed": 42}, "flight-search", []).random()
+        self.assertEqual(erc._draws({"seed": 42}, "flight-search", []).random(), first)
+        self.assertNotEqual(erc._draws({"seed": 42}, "flight-search", _history(1, [100])).random(), first)
+
+    def test_pick_follows_the_strategy_of_the_config(self):
+        peers = _peers(("a#1", 1, "0xA"))
+        cfg = {**CHAIN, "reviewers": [US], "trust": {"half_life": None}}
+        with patch.object(erc, "ratings", return_value={1: (2, 50.0)}), \
+                patch.object(erc, "all_ratings", return_value=_history(1, [100, 0])):
+            self.assertEqual(erc.pick(cfg, peers, "c"), ("a#1", "rated 50/100 by 2 rating(s)"))
+            self.assertEqual(erc.pick({**cfg, "strategy": "S3"}, peers, "c"), ("a#1", "trust 0.50 from 2 rating(s)"))
+            with self.assertRaises(ValueError):
+                erc.pick({**cfg, "strategy": "S9"}, peers, "c")
 
 
 class TestAgentIdFromName(unittest.TestCase):
@@ -105,6 +184,16 @@ class TestToolsWithErc8004(unittest.TestCase):
                 patch.object(a2at, "_send_task", return_value=("ok", "ctx-1", "")) as send:
             a2at.a2a_delegate({"capability": "flight-search", "message": {"from": "Pisa", "to": "Rome"}})
         self.assertEqual(send.call_args.args[2], '{"from": "Pisa", "to": "Rome"}')
+
+    def test_delegate_with_s3_reads_every_rating(self):
+        found = {"flights#3": {"url": "http://y.invalid", "capabilities": ["flight-search"], "agent_id": 3,
+                               "owner": "0xA"}}
+        cfg = {"erc8004": {**CHAIN, "strategy": "S3", "reviewers": [US]}}
+        with self._config(cfg), patch.object(erc, "discover_peers", return_value=found), \
+                patch.object(erc, "all_ratings", return_value=[]), \
+                patch.object(a2at, "_send_task", return_value=("ok", "ctx-1", "")):
+            reply = a2at.a2a_delegate({"capability": "flight-search", "message": "Pisa to Rome"})
+        self.assertIn("[delegate: flights#3 · trust 0.50 from 0 rating(s)", reply)
 
     def test_feedback_checks_its_inputs(self):
         with self._config({"erc8004": CHAIN}):

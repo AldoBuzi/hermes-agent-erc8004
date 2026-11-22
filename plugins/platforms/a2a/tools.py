@@ -300,7 +300,7 @@ def a2a_orchestrate(args: dict, **_: Any) -> str:
 
 
 def a2a_delegate(args: dict, **_: Any) -> str:
-    """Send a task to ONE on-chain peer with the capability: the one with the best ERC-8004 rating."""
+    """Send a task to ONE on-chain peer with the capability: the one that the strategy (S2 or S3) trusts most."""
     capability = str(args.get("capability") or "").strip()
     raw = args.get("message") or args.get("task") or ""
     # Models often pass the message as an object: send it as JSON, which agents can read, not as Python text.
@@ -315,9 +315,7 @@ def a2a_delegate(args: dict, **_: Any) -> str:
                  if capability in peer["capabilities"]}
         if not peers:
             return f"Error: no agent in the ERC-8004 Identity Registry declares the capability '{capability}'."
-        by_id = erc8004.ratings(chain, [peer["agent_id"] for peer in peers.values()], capability)
-        rated = {name: by_id[peer["agent_id"]] for name, peer in peers.items()}
-        name = erc8004.choose(rated, erc8004.random_source(chain))
+        name, rating = erc8004.pick(chain, peers, capability)
     except Exception as e:
         return f"Error: the ERC-8004 lookup failed — {e}."
     rate_hint = f"a2a_feedback(agent='{name}', value=0-100, capability='{capability}')"
@@ -325,8 +323,6 @@ def a2a_delegate(args: dict, **_: Any) -> str:
         reply, reply_ctx, state = _send_task(name, _peer_from_entry(peers[name]), message, context_id)
     except Exception as e:
         return f"Error: call to '{name}' failed — {e}. Rate the failure with {rate_hint.replace('0-100', '0')}."
-    count, average = rated[name]
-    rating = f"rated {average:g}/100 by {count} rating(s)" if count else "not rated yet"
     short_state = state.replace("TASK_STATE_", "").replace("_", "-").lower()
     header = f"[delegate: {name} · {rating} · context {reply_ctx}" + (f" · {short_state}" if state else "") + "]"
     return f"{header}\n{reply or '(no text reply)'}\n\n(Check this answer, then rate the peer: {rate_hint}.)"
