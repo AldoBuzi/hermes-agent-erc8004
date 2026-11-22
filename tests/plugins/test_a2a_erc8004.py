@@ -94,9 +94,21 @@ class TestTrustAware(unittest.TestCase):
         self.assertGreater(chosen["new#2"], 0)
 
     def test_each_choice_draws_new_numbers_but_a_rerun_repeats_them(self):
-        first = erc._draws({"seed": 42}, "flight-search", []).random()
-        self.assertEqual(erc._draws({"seed": 42}, "flight-search", []).random(), first)
-        self.assertNotEqual(erc._draws({"seed": 42}, "flight-search", _history(1, [100])).random(), first)
+        def session(found, choices=2):  # a new process: its count of S3 choices starts at zero
+            with patch.object(erc, "_s3_choices", 0):
+                return [erc._draws({"seed": 42}, "flight-search", found).random() for _ in range(choices)]
+        first, retry = session([])
+        self.assertNotEqual(retry, first)  # a retry in the same session, with the same ratings
+        self.assertEqual(session([]), [first, retry])  # a rerun on the same chain
+        self.assertNotEqual(session(_history(1, [100]), choices=1), [first])  # the next session, after a rating
+
+    def test_a_retry_does_not_always_go_to_the_same_failing_peer(self):
+        """Inside a session nobody rates the answers, as in R000 of the run of 22 November 2026."""
+        peers = _peers(("fails#1", 1, "0xA"), ("other#2", 2, "0xB"), ("third#3", 3, "0xC"))
+        cfg = {**CHAIN, "reviewers": [US], "seed": 42, "strategy": "S3"}
+        with patch.object(erc, "_s3_choices", 0), patch.object(erc, "all_ratings", return_value=[]):
+            chosen = {erc.pick(cfg, peers, "flight-search")[0] for _ in range(10)}
+        self.assertGreater(len(chosen), 1)
 
     def test_pick_follows_the_strategy_of_the_config(self):
         peers = _peers(("a#1", 1, "0xA"))

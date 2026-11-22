@@ -345,17 +345,25 @@ def choose_trust_aware(belief: dict[str, tuple[float, float]], rng: random.Rando
     return max(names, key=samples.__getitem__)
 
 
+_s3_choices = 0  # how many S3 choices this process has made
+
+
 def _draws(cfg: dict, capability: str, found: list[Rating]) -> random.Random:
     """The random generator for one S3 choice.
 
-    Every Hermes session is a new process, so a generator seeded once per process would repeat
-    the same numbers in every session, and a peer whose first sample was low would never be
-    tried. With a seed, the numbers therefore depend on the seed, the capability and the number
-    of ratings: they change from one choice to the next, and a rerun on the same chain repeats them.
+    Every Hermes session is a new process, and inside a session the ratings do not change until
+    someone rates an answer. A generator seeded once per process would repeat the same numbers in
+    every session, so a peer whose first sample was low would never be tried. One seeded only by
+    the ratings would repeat them on every retry inside a session, so a failing peer would be
+    chosen again and again. With a seed, the numbers therefore depend on the seed, the capability,
+    the number of ratings and the number of S3 choices that this process made before: every choice
+    gets new numbers, and a rerun on the same chain repeats them.
     """
+    global _s3_choices
+    _s3_choices += 1
     if cfg.get("seed") is None:
         return random_source(cfg)
-    return random.Random(f"{cfg['seed']}:{capability}:{len(found)}")
+    return random.Random(f"{cfg['seed']}:{capability}:{len(found)}:{_s3_choices}")
 
 
 STRATEGIES = ("S2", "S3")
