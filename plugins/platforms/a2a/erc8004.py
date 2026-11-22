@@ -21,6 +21,7 @@ after a task. With an ``erc8004`` section in config.yaml:
       key_env: "ERC8004_PRIVATE_KEY"  # environment variable with the wallet's private key
       seed: 42                        # optional: repeatable random choices
       strategy: S2                    # S2 (the default) or S3, see below
+      delegate_only: false            # true hides a2a_call and a2a_orchestrate: every task uses the strategy
       trust:                          # optional, S3 only: each key overrides one default
         other_weight: 0.1             # the weight of a rating from a reviewer not in reviewers
         half_life: 5                  # after this many newer ratings, a rating counts half; null: off

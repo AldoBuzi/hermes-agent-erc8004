@@ -428,12 +428,27 @@ def _a2a_tools_available() -> bool:
         return False
 
 
+# The tools that send a task to a peer that the model names itself, past any selection strategy.
+_PEER_CHOICE_TOOLS = ("a2a_call", "a2a_orchestrate")
+
+
+def _peer_choice_tools_available() -> bool:
+    """check_fn of a2a_call and a2a_orchestrate: like the other client tools, but hidden when the
+    erc8004 section sets ``delegate_only``, so that every task goes through a2a_delegate and its strategy."""
+    if not _a2a_tools_available():
+        return False
+    with contextlib.suppress(Exception):
+        return not (_load_config().get("erc8004") or {}).get("delegate_only")
+    return True
+
+
 def register_tools(ctx) -> None:
     """Register the client tools in the ``a2a`` toolset (config-gated)."""
     for name, (handler, description, properties, required) in _TOOLS.items():
         parameters: dict[str, Any] = {"type": "object", "properties": properties}
         if required:
             parameters["required"] = required
+        check = _peer_choice_tools_available if name in _PEER_CHOICE_TOOLS else _a2a_tools_available
         ctx.register_tool(name=name, toolset="a2a", handler=handler, description=description,
                           schema={"name": name, "description": description, "parameters": parameters},
-                          emoji="\U0001f9e9", check_fn=_a2a_tools_available)  # puzzle piece
+                          emoji="\U0001f9e9", check_fn=check)  # puzzle piece

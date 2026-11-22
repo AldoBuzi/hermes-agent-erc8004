@@ -174,6 +174,20 @@ class TestToolsWithErc8004(unittest.TestCase):
         with self._config({"erc8004": CHAIN}):
             self.assertTrue(a2at._a2a_tools_available())
 
+    def test_delegate_only_hides_the_tools_that_let_the_model_choose_the_peer(self):
+        with self._config({"erc8004": CHAIN}):
+            self.assertTrue(a2at._peer_choice_tools_available())
+        with self._config({"erc8004": {**CHAIN, "delegate_only": True}}):
+            self.assertFalse(a2at._peer_choice_tools_available())
+            self.assertTrue(a2at._a2a_tools_available())  # a2a_delegate and the other tools stay
+
+    def test_only_a2a_call_and_a2a_orchestrate_get_the_delegate_only_check(self):
+        checks = {}
+        a2at.register_tools(SimpleNamespace(register_tool=lambda **tool: checks.update({tool["name"]: tool["check_fn"]})))
+        hidden = {name for name, check in checks.items() if check is a2at._peer_choice_tools_available}
+        self.assertEqual(hidden, {"a2a_call", "a2a_orchestrate"})
+        self.assertIn("a2a_delegate", checks)
+
     def test_on_chain_peers_join_the_hand_written_ones(self):
         found = {"flights#3": {"url": "http://y.invalid", "capabilities": ["flight-search"], "agent_id": 3}}
         cfg = {"a2a_agents": {"r": {"url": "http://x.invalid"}}, "erc8004": CHAIN}

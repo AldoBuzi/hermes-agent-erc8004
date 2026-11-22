@@ -72,6 +72,8 @@ erc8004:
   key_env: "ERC8004_PRIVATE_KEY" # env var with the private key of a TEST wallet
   seed: 42                       # optional: repeatable random choices
   strategy: S2                   # S2 (plain average) or S3 (trust-aware)
+  delegate_only: false           # true hides a2a_call and a2a_orchestrate,
+                                 # so every task goes through the strategy
   trust:                         # optional, S3 only: each key overrides one default
     other_weight: 0.1            # weight of a rating from a reviewer not in reviewers
     half_life: 5                 # after this many newer ratings, a rating counts half

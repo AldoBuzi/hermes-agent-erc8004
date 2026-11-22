@@ -48,7 +48,9 @@ class TestA2AToolsGate(unittest.TestCase):
 
     def test_all_five_tools_carry_the_gate(self):
         """Every a2a_* registration must pass the check_fn — a sixth tool
-        added without it would silently reopen the hole."""
+        added without it would silently reopen the hole. a2a_call and
+        a2a_orchestrate get it through _peer_choice_tools_available, which
+        also hides them when erc8004.delegate_only is set."""
         seen = {}
 
         class Ctx:
@@ -58,7 +60,9 @@ class TestA2AToolsGate(unittest.TestCase):
         a2at.register_tools(Ctx())
         self.assertTrue(seen)
         for name, fn in seen.items():
-            self.assertIs(fn, a2at._a2a_tools_available, name)
+            self.assertIn(fn, (a2at._a2a_tools_available, a2at._peer_choice_tools_available), name)
+        with patch.object(a2at, "_load_config", return_value={}):
+            self.assertFalse(a2at._peer_choice_tools_available())  # closed whenever the gate is closed
 
 
 if __name__ == "__main__":
