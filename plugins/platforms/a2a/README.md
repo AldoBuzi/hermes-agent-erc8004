@@ -86,8 +86,9 @@ It needs `web3` in Hermes's environment. Ratings use `tag1 = "task"` and
 
 ### Try it
 
-Status: the ERC-8004 tools pass their tests and work when they are called directly, but no
-session driven by an LLM has used them yet.
+Status: the ERC-8004 tools pass their tests, and sessions driven by an LLM (DeepSeek's
+`deepseek-flash`) have used them on a local copy of Base Sepolia; they have not run on the
+public chain yet.
 
 Hermes's lock file covers only Python 3.14. A plain `pip install -e .` stops on a Pillow
 version conflict that only the lock file settles, so install from the lock with
